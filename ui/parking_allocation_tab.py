@@ -8,6 +8,7 @@ import queue
 import time
 import random
 from datetime import datetime
+import traceback
 
 
 class ParkingAllocationTab:
@@ -179,231 +180,283 @@ class ParkingAllocationTab:
         ttk.Separator(self.control_frame, orient="horizontal").pack(fill="x", padx=5, pady=10)
 
     def update_visualization(self):
-        """Update the parking visualization with improved error handling for threading issues"""
+        """Update the parking visualization with simplified error handling"""
         if not self.show_visualization.get():
             return
 
         try:
-            # Check if we need to recreate the figure - this needs more robust checking
+            # Check if we need to recreate the figure
             canvas_exists = hasattr(self, 'canvas') and self.canvas and self.canvas.get_tk_widget().winfo_exists()
             figure_exists = hasattr(self, 'fig') and self.fig is not None
             ax_exists = hasattr(self, 'ax') and self.ax is not None
 
-            # Completely recreate the figure and canvas if any component is missing or invalid
+            # Create or recreate visualization components if needed
             if not (canvas_exists and figure_exists and ax_exists):
-                # Clean up old components if they exist
                 if hasattr(self, 'canvas') and self.canvas:
                     try:
                         self.canvas.get_tk_widget().destroy()
-                    except:
+                    except Exception as e:
+                        print(f"Error destroying canvas: {e}")
                         pass
 
-                # Create fresh components
                 self.fig = plt.Figure(figsize=(10, 6), dpi=100)
                 self.ax = self.fig.add_subplot(111)
                 self.canvas = FigureCanvasTkAgg(self.fig, self.canvas_frame)
                 self.canvas.get_tk_widget().grid(row=0, column=0, sticky="nsew")
-                # Adding the canvas to the window directly should help with stability
-                self.canvas.draw()
 
-            # Clear the figure
+            # Clear the figure for fresh drawing
             self.ax.clear()
 
-            # Get FRESH parking data directly from the parking manager
+            # Get parking data
             parking_data = {}
-            if hasattr(self.app, 'parking_manager'):
-                if hasattr(self.app.parking_manager, 'parking_data'):
-                    parking_data = self.app.parking_manager.parking_data.copy()
+            if hasattr(self.app, 'parking_manager') and hasattr(self.app.parking_manager, 'parking_data'):
+                parking_data = self.app.parking_manager.parking_data.copy()
 
-            # If no data is available, show a message
-            if not parking_data:
-                self.ax.text(0.5, 0.5, "No parking data available",
-                             ha='center', va='center', fontsize=14)
-                try:
-                    self.canvas.draw()
-                except Exception as e:
-                    print(f"Draw error on empty data: {str(e)}")
-                return
-
-            # Ensure allocated vehicles are reflected in the visualization
+            # Update allocated vehicles
             for vehicle_id, space_id in self.allocated_vehicles.items():
                 if space_id in parking_data:
                     parking_data[space_id]['occupied'] = True
                     parking_data[space_id]['vehicle_id'] = vehicle_id
 
-            # Calculate statistics - only count non-group spaces
-            non_group_spaces = {id: data for id, data in parking_data.items()
-                                if not data.get('is_group', False)}
-            free_count = sum(1 for data in non_group_spaces.values() if not data.get('occupied', True))
-            total = len(non_group_spaces)
-            occupied_count = total - free_count
+            # If no posList or parking data, show message
+            if (not hasattr(self.app, 'posList') or not self.app.posList or
+                    not parking_data):
+                self.ax.text(0.5, 0.5, "No parking data available",
+                             ha='center', va='center', fontsize=14)
+                self.canvas.draw()
+                return
 
-            # Calculate grid dimensions
-            if total > 0:
-                cols = max(4, int(np.ceil(np.sqrt(total))))
-                rows = int(np.ceil(total / cols))
-            else:
-                cols, rows = 4, 4
+            # Calculate statistics
+            individual_spaces = {id: data for id, data in parking_data.items()
+                                 if not data.get('is_group', False)}
+            group_spaces = {id: data for id, data in parking_data.items()
+                            if data.get('is_group', False)}
 
-            # Set plot limits
-            space_w, space_h = 100, 60
+            free_count = sum(1 for data in individual_spaces.values()
+                             if not data.get('occupied', True))
+            total = len(individual_spaces)
+
+            # Set up grid layout
+            space_w = 80
+            space_h = 50
             margin = 20
-            self.ax.set_xlim(0, cols * space_w + 2 * margin)
-            self.ax.set_ylim(0, rows * space_h + 2 * margin)
+            cols = max(3, min(8, int(np.sqrt(total * 2))))  # More reasonable column count
 
-            # Filter out only spaces (no groups) for visualization
-            # and make sure we have valid posList
-            if not hasattr(self.app, 'posList') or not self.app.posList:
-                self.ax.text(0.5, 0.5, "No parking spaces defined",
-                             ha='center', va='center', fontsize=14)
-                try:
-                    self.canvas.draw()
-                except Exception as e:
-                    print(f"Draw error on no spaces: {str(e)}")
-                return
+            # Calculate rows needed for individual spaces and groups
+            individual_rows = (len(individual_spaces) + cols - 1) // cols
+            group_rows = (len(group_spaces) + (cols // 2) - 1) // (cols // 2) if group_spaces else 0
 
-            # Get valid positions from posList
-            valid_positions = []
-            for pos in self.app.posList:
-                if isinstance(pos, tuple) and len(pos) == 4:
-                    valid_positions.append(pos)
+            # Set plot area - make sure it's large enough
+            plot_width = cols * space_w + 2 * margin
+            plot_height = (individual_rows + group_rows + 3) * space_h + 3 * margin
 
-            if not valid_positions:
-                self.ax.text(0.5, 0.5, "No valid parking spaces defined",
-                             ha='center', va='center', fontsize=14)
-                try:
-                    self.canvas.draw()
-                except Exception as e:
-                    print(f"Draw error on no valid spaces: {str(e)}")
-                return
+            self.ax.set_xlim(0, plot_width)
+            self.ax.set_ylim(0, plot_height)
 
-            # Draw all spaces individually - don't group them
-            space_positions = {}  # Store visual positions for each space
-            i = 0  # Counter for space position calculation
+            # Draw section headers
+            current_y = plot_height - margin
 
-            # Draw regular spaces only - skip any non-tuple or non-4-value positions
+            # Draw individual spaces section header
+            self.ax.text(margin, current_y, "INDIVIDUAL SPACES",
+                         fontsize=14, fontweight='bold')
+            current_y -= space_h
+
+            # Draw individual spaces
+            space_i = 0
             for idx, pos in enumerate(self.app.posList):
-                # Skip if not a valid position tuple
                 if not isinstance(pos, tuple) or len(pos) != 4:
                     continue
 
                 x, y, w, h = pos
 
-                # Skip if the data is invalid
-                if None in (x, y, w, h) or not all(isinstance(val, (int, float)) for val in (x, y, w, h)):
+                # Create space ID
+                section = "A" if x < getattr(self.app, 'image_width', 1000) / 2 else "B"
+                section += "1" if y < getattr(self.app, 'image_height', 1000) / 2 else "2"
+                space_id = f"S{idx + 1}-{section}"
+
+                # Skip if part of a group
+                is_in_group = False
+                if space_id in individual_spaces:
+                    is_in_group = individual_spaces[space_id].get('in_group', False)
+
+                if is_in_group:
                     continue
 
-                # Get the corresponding space ID
-                try:
-                    section = "A" if x < self.app.image_width / 2 else "B"
-                    section += "1" if y < self.app.image_height / 2 else "2"
-                    space_id = f"S{idx + 1}-{section}"
+                # Calculate position in grid
+                row = space_i // cols
+                col = space_i % cols
 
-                    row = i // cols
-                    col = i % cols
+                x_pos = margin + col * space_w
+                y_pos = current_y - (row + 1) * space_h
 
-                    x_pos = col * space_w + margin
-                    y_pos = (rows - row - 1) * space_h + margin  # Invert y for better visualization
+                # Get occupancy
+                is_occupied = True
+                vehicle_id = None
+                if space_id in parking_data:
+                    is_occupied = parking_data[space_id].get('occupied', True)
+                    vehicle_id = parking_data[space_id].get('vehicle_id')
 
-                    # Store position for later reference
-                    space_positions[space_id] = (x_pos, y_pos, space_w, space_h)
+                # Set color
+                color = 'red' if is_occupied else 'green'
 
-                    # Get occupancy data
-                    is_occupied = True
-                    vehicle_id = None
+                # Draw rectangle
+                rect = plt.Rectangle((x_pos, y_pos), space_w - 10, space_h - 5,
+                                     linewidth=2, edgecolor='black',
+                                     facecolor=color, alpha=0.6)
+                self.ax.add_patch(rect)
 
-                    if space_id in parking_data:
-                        is_occupied = parking_data[space_id].get('occupied', True)
-                        vehicle_id = parking_data[space_id].get('vehicle_id')
+                # Add space ID
+                self.ax.text(x_pos + 5, y_pos + space_h - 15, space_id,
+                             fontsize=8, weight='bold', color='white')
 
-                    # Choose color based on occupancy
-                    color = 'red' if is_occupied else 'green'
-                    edgecolor = 'black'
+                # Add vehicle ID if occupied
+                if is_occupied and vehicle_id:
+                    self.ax.text(x_pos + 5, y_pos + 10, f"V: {vehicle_id}",
+                                 fontsize=8, color='white')
 
-                    # Create rectangle
-                    rect = plt.Rectangle((x_pos, y_pos), space_w - 5, space_h - 5,
-                                         linewidth=2, edgecolor=edgecolor,
-                                         facecolor=color, alpha=0.6)
+                space_i += 1
+
+            # Update current y position after individual spaces
+            current_y -= (individual_rows + 1) * space_h
+
+            # Draw separator
+            if group_spaces:
+                self.ax.axhline(y=current_y + space_h / 2, color='gray',
+                                linestyle='-', linewidth=1)
+
+                # Draw group section header
+                current_y -= space_h
+                self.ax.text(margin, current_y, "GROUP SPACES",
+                             fontsize=14, fontweight='bold')
+                current_y -= space_h
+
+                # Draw groups - with larger boxes
+                group_i = 0
+                group_cols = cols // 2  # Fewer columns for groups
+                group_w = space_w * 1.8
+                group_h = space_h * 1.5
+
+                for group_id, group_data in group_spaces.items():
+                    # Calculate position
+                    row = group_i // group_cols
+                    col = group_i % group_cols
+
+                    x_pos = margin + col * group_w * 1.1  # Add extra spacing between groups
+                    y_pos = current_y - (row + 1) * group_h
+
+                    # Get group details
+                    is_occupied = group_data.get('occupied', False)
+                    member_spaces = group_data.get('member_spaces', [])
+
+                    # Count occupied members
+                    occupied_count = 0
+                    for member_idx in member_spaces:
+                        if member_idx < len(self.app.posList):
+                            member_x, member_y, member_w, member_h = self.app.posList[member_idx]
+                            member_section = "A" if member_x < getattr(self.app, 'image_width', 1000) / 2 else "B"
+                            member_section += "1" if member_y < getattr(self.app, 'image_height', 1000) / 2 else "2"
+                            member_id = f"S{member_idx + 1}-{member_section}"
+
+                            if member_id in parking_data and parking_data[member_id].get('occupied', False):
+                                occupied_count += 1
+
+                    # Determine color
+                    if is_occupied or occupied_count == len(member_spaces):
+                        color = 'red'  # Fully occupied
+                    elif occupied_count > 0:
+                        color = 'orange'  # Partially occupied
+                    else:
+                        color = 'green'  # Free
+
+                    # Draw group box
+                    rect = plt.Rectangle((x_pos, y_pos), group_w - 10, group_h - 5,
+                                         linewidth=3, edgecolor='blue',
+                                         facecolor=color, alpha=0.5)
                     self.ax.add_patch(rect)
 
-                    # Add space ID
-                    self.ax.text(x_pos + 5, y_pos + space_h - 15, space_id,
-                                 fontsize=8, weight='bold', color='white')
+                    # Add group title
+                    self.ax.text(x_pos + 5, y_pos + group_h - 20, f"{group_id}",
+                                 fontsize=12, fontweight='bold', color='black')
 
-                    # Add vehicle ID if occupied
-                    if is_occupied and vehicle_id:
-                        self.ax.text(x_pos + 5, y_pos + 10, f"V: {vehicle_id}",
-                                     fontsize=8, color='white')
+                    # Add occupancy info
+                    self.ax.text(x_pos + 5, y_pos + group_h - 40,
+                                 f"({occupied_count}/{len(member_spaces)} occupied)",
+                                 fontsize=9, color='black')
 
-                    # Increment counter
-                    i += 1
+                    # Add small indicators for member spaces
+                    mini_w = (group_w - 30) / min(4, max(1, len(member_spaces)))
+                    mini_h = mini_w * 0.6
 
-                except Exception as e:
-                    print(f"Error processing space {idx}: {str(e)}")
-                    continue
+                    for idx, member_idx in enumerate(member_spaces):
+                        if member_idx < len(self.app.posList):
+                            # Calculate position for mini-space
+                            mini_row = idx // 4
+                            mini_col = idx % 4
 
-            # Add legend elements
+                            mini_x = x_pos + 5 + mini_col * mini_w + 2
+                            mini_y = y_pos + 5 + mini_row * mini_h + 2
+
+                            # Check if occupied
+                            member_x, member_y, member_w, member_h = self.app.posList[member_idx]
+                            member_section = "A" if member_x < getattr(self.app, 'image_width', 1000) / 2 else "B"
+                            member_section += "1" if member_y < getattr(self.app, 'image_height', 1000) / 2 else "2"
+                            member_id = f"S{member_idx + 1}-{member_section}"
+
+                            is_mini_occupied = False
+                            if member_id in parking_data:
+                                is_mini_occupied = parking_data[member_id].get('occupied', False)
+
+                            # Draw mini space
+                            mini_color = 'red' if is_mini_occupied else 'green'
+                            mini_rect = plt.Rectangle((mini_x, mini_y),
+                                                      mini_w - 4, mini_h - 4,
+                                                      linewidth=1, edgecolor='black',
+                                                      facecolor=mini_color, alpha=0.8)
+                            self.ax.add_patch(mini_rect)
+
+                            # Number the mini space
+                            self.ax.text(mini_x + 2, mini_y + 2, f"{member_idx + 1}",
+                                         fontsize=6, color='white')
+
+                    group_i += 1
+
+            # Add legend
             legend_elements = [
                 plt.Rectangle((0, 0), 1, 1, facecolor='green', alpha=0.6),
-                plt.Rectangle((0, 0), 1, 1, facecolor='red', alpha=0.6)
+                plt.Rectangle((0, 0), 1, 1, facecolor='red', alpha=0.6),
+                plt.Rectangle((0, 0), 1, 1, facecolor='orange', alpha=0.6),
             ]
-            legend_labels = ['Free', 'Occupied']
+            legend_labels = ['Free', 'Occupied', 'Partially Occupied']
 
-            # Add title and legend
-            self.ax.set_title(f"Parking Status: {free_count}/{total} Available")
-            self.ax.legend(legend_elements, legend_labels)
+            self.ax.legend(legend_elements, legend_labels, loc='upper right')
 
-            # Remove axis ticks for cleaner look
+            # Add title with stats
+            self.ax.set_title(f"Parking Status: {free_count}/{total} Available, {len(group_spaces)} Groups")
+
+            # Remove axis ticks
             self.ax.set_xticks([])
             self.ax.set_yticks([])
 
-            # Add timestamp with formatted time
-            from datetime import datetime
+            # Add timestamp
             current_time = datetime.now().strftime('%H:%M:%S')
-            self.ax.text(margin, margin / 2,
-                         f"Updated: {current_time}",
-                         fontsize=8)
+            self.ax.text(margin, margin / 2, f"Updated: {current_time}", fontsize=8)
 
-            # Draw the canvas - use try/except to catch any drawing errors
-            try:
-                self.canvas.draw()
-            except Exception as e:
-                print(f"Canvas draw error: {str(e)}")
+            # Draw the canvas
+            self.canvas.draw()
 
         except Exception as e:
             print(f"Visualization error: {str(e)}")
             import traceback
             traceback.print_exc()
 
-            # Try to recreate the visualization for next time
+            # Simple error display
             try:
-                # Clean up
-                if hasattr(self, 'canvas') and self.canvas:
-                    try:
-                        self.canvas.get_tk_widget().destroy()
-                    except:
-                        pass
-
-                # Create fresh components for next update
-                self.fig = plt.Figure(figsize=(10, 6), dpi=100)
-                self.ax = self.fig.add_subplot(111)
-                self.canvas = FigureCanvasTkAgg(self.fig, self.canvas_frame)
-                self.canvas.get_tk_widget().grid(row=0, column=0, sticky="nsew")
-
-                # Display error message
+                self.ax.clear()
                 self.ax.text(0.5, 0.5, f"Visualization Error: {str(e)}",
-                             ha='center', va='center', fontsize=10, color='red')
-
-                try:
-                    self.canvas.draw()
-                except:
-                    # If still failing, don't do anything - we'll try again next cycle
-                    pass
+                             ha='center', va='center', fontsize=12, color='red')
+                self.canvas.draw()
             except:
-                # Last resort - remove all references so we fully recreate next time
-                self.fig = None
-                self.ax = None
-                self.canvas = None
+                pass
 
     def are_groups_opposite(self, group1, group2):
         """
